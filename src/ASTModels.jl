@@ -1,8 +1,9 @@
 module ASTModels
 export
-  replace_subexpr!, substitute!, FloatX, cast, traverse_expr_functions, expr, @expr,
+  replace_subexpr!, substitute!, FloatX, cast, traverse_noconflict_expr_functions, expr, @expr,
   Model, default_input_fields, default_output_fields, merge_models, TypeWithModel,
-  astfunc, @astfunc, clone, TestTypeWithModel
+  astfunc, @astfunc, clone, TestTypeWithModel, traverse_noconflict_methods_sig, create_function_file,
+  traverse_ASTleaves
 
 using Continuables
 include("./util.jl")
@@ -29,12 +30,6 @@ end
 
 # expr(es...) = expr.(es)  # single case is already taken over by expr(e)
 
-function _expr_def(e::Symbol)
-  # we need Expr(:quote, e) for it to be a true symbol and not a reference
-  qe = Expr(:quote, e)
-  :($e = expr($qe))
-end
-
 """
 @expr a b c
 will expand to
@@ -45,26 +40,31 @@ c = :(c::Any)
 ```
 creating new basic, identifyable Expressions
 """
-macro expr(es::Symbol...)
-  esc(Expr(:block, _expr_def.(es)..., nothing))  # hygiene
+macro expr(ss::Symbol...)
+  es = map(ss) do s
+    # expr should be this package's `expr`
+    rhs = QuoteNode(expr(s)) # we want this to stay expression
+    :($s = $rhs)
+  end
+  esc(Expr(:block, es..., nothing))  # hygiene
 end
 
 """
 creates a function expr which mimics a given function however with new types
 """
-function create_expr_function(s::Symbol, types::Vector{DataType}, m::Module=Base)
+function create_expr_function(s::Symbol, types, m::Module=Base)
   vars = [Symbol(t===Expr ? :e : :o, i) for (i, t) in enumerate(types)]
 
-  if (startswith(string(s), ".")  # either is dot syntax (deprecated I thought, but still occurs, method seems to not exist)
-    | eval(m, :(method_exists($s, $types))) # any_method_exists(s, types, m)  # or method already exists in the given package (maybe better to just execute this within this scope? would it be the global scope?)
-    | (string(s) != function_name(eval(m, s)))) # or maybe this is a reference to something else, i.e. the symbol is not the same as the string transformation
+  if (string(s)[1] ∈ ['.', '@']  # either is dot syntax (deprecated I thought, but still occurs, method seems to not exist) or a macro
+    || eval(m, :(method_exists($s, $types)))  # or method already exists in the given package (maybe better to just execute this within this scope? would it be the global scope?)
+    || (string(s) != function_name(eval(m, s)))) # or maybe this is a reference to something else, i.e. the symbol is not the same as the string transformation
     return
   end
 
   vars_typed = [Expr(:(::), x, t) for (x, t) in zip(vars, types)]
   vars_casted = [t === Expr ? x : :(expr($x)) for (x, t) in zip(vars, types)]
 
-  f_head = Expr(:call, s, vars_typed...)
+  f_head = Expr(:call, :($s), vars_typed...)
   f_body = Expr(:call, :Expr, :(:call), QuoteNode(s), vars_casted...)
   Expr(:function, f_head, f_body)
 end
@@ -72,46 +72,46 @@ end
 """
 continuable over function expressions for Expr types
 """
-traverse_expr_functions(s::Symbol, i::Integer, m::Module=Base) = cont -> begin
-  atleast_one_each = mycombinations(i, Expr, Any)[1:end-1,:]
-  # atleast_one_each = permutedims(atleast_one_each, (2,1))  # transpose for iteration
-  cslices(atleast_one_each, 2) do row
-    expr = create_expr_function(s, row, m)
-    if expr !== nothing
-      cont(expr)
-    end
-  end
-end
-traverse_expr_functions(cont, s::Symbol, i::Integer, m::Module=Base) = traverse_expr_functions(s, i, m)(cont)
-
-traverse_expr_functions(mod::Module=Base, exclude=[]) = cont -> begin
+traverse_noconflict_expr_functions(mod::Module=Base, exclude=[]) = cont -> begin
   exclude = Set(exclude)
   for s in names(mod)
     if s in exclude
       continue
     end
-    try
       f = eval(mod, s)
       if isa(f, Function)
-        for i in methods_sig_lengths(f)
-          traverse_expr_functions(s, i, mod)(cont)
+        traverse_noconflict_methods_sig(f) do types
+          expr = create_expr_function(s, types, mod)
+          if expr !== nothing
+            cont(expr)
+          end
         end
-        # print(s)
-        # print(" ")
       end
-    catch exc
-      if !isa(exc, Union{StackOverflowError, MethodError})
-        rethrow()
-      end
+  end
+end
+
+traverse_noconflict_expr_functions(cont, mod::Module=Base, exclude=[]) = traverse_noconflict_expr_functions(mod, exclude)(cont)
+
+
+function create_function_file(path::String, mod::Module=Base)
+  open(path, "w") do f
+    write(f, "importall Base\n")
+    traverse_noconflict_expr_functions(Base) do expr
+      write(f, string(expr) * "\n")
     end
   end
 end
-traverse_expr_functions(cont, mod::Module=Base, exclude=[]) = traverse_expr_functions(mod, exclude)(cont)
+# csuppress(eval, Union{StackOverflowError, MethodError}))
+# [:show, :haskey, :push!, :display, :setindex!]
 
 
-# run for base:
-importall Base
-traverse_expr_functions(Base, [:show, :haskey, :push!, :display, :setindex!])(eval)  # TODO get ambigous methods errors - maybe we can automatically check for ambiguity and filter
+# run for base (now everything seems to work fine, no exceptions anylonger):
+# importall Base
+# traverse_noconflict_expr_functions(Base)(eval)
+
+# build using create_function_file()
+include("./base_expr.jl")  # much faster than computing the functions itself
+
 
 
 ## General helpers for altering AST ---------------------------------------------------------------------------------------------------------
@@ -274,5 +274,32 @@ function clone(inputs, outputs; new_inputs=[])
   end
   f(new_inputs...)
 end
+
+clone(outputs) = clone(collect(traverse_ASTleaves(outputs)), outputs)  # new_inputs make no sense if you don't know yet what the inputs are
+
+
+traverse_ASTleaves(l::Union{Array,Tuple}) = cont -> begin
+  for a in l
+    if isa(a, Expr)
+      traverse_ASTleaves(a)(cont)
+    end
+  end
+end
+
+traverse_ASTleaves(expr::Expr) = cont -> begin
+  if expr.head==:(::) && isa(expr.args[1], Symbol)
+    # for simplicity we regard every symbol complemented with type check as a leave
+    cont(expr)
+
+  elseif expr.head ∈ [:(=), :function]
+    # skip over assignment part, as this naturally includes symbols
+    traverse_ASTleaves(expr.args[2:end])(cont)
+
+  else
+    # travers everything
+    traverse_ASTleaves(expr.args)(cont)
+  end
+end
+traverse_ASTleaves(cont, expr::Expr) = traverse_ASTleaves(expr)(cont)
 
 end # module
