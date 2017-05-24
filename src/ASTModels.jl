@@ -9,8 +9,6 @@ using Continuables
 include("./util.jl")
 
 
-FloatX = Float64
-
 ## expr functionalities ---------------------------------------------------------------------------------------------------------------------------
 
 # when bringing anything else than Expr into an Expr, we preserve the possibility to cast the respective object
@@ -95,7 +93,7 @@ traverse_noconflict_expr_functions(cont, mod::Module=Base, exclude=[]) = travers
 
 function create_function_file(path::String, mod::Module=Base)
   open(path, "w") do f
-    write(f, "importall Base\n")
+    write(f, "importall " * string(mod) * "\n")
     traverse_noconflict_expr_functions(Base) do expr
       write(f, string(expr) * "\n")
     end
@@ -248,13 +246,14 @@ macro astfunc(e)
       args = eval.($args)  # seamingly macros don't work well with overwriting
       body = eval($body)
 
-      astfunc(args, body)
-      # new_symbols = [:($(Symbol(n))::Any) for n in take('a':'z', length(args))]
-      # old_symbols = substitute!.(args, new_symbols)  # Dict(zip(args, symbols))  ??
-      # f_def = Expr(:tuple, new_symbols...)
-      # f = eval(Expr(:(->), f_def, body))  # evaluate function
-      # new_symbols = substitute!.(args, old_symbols)
-      # f
+      # execute new function in calling namespace in order to refer to correct `cast` function
+      # astfunc(args, body)  # this would be executed in ASTModels namespace, referring to its cast function for instance
+      new_symbols = [:($(Symbol(n))::Any) for n in take('a':'z', length(args))]
+      old_symbols = substitute!.(args, new_symbols)  # Dict(zip(args, symbols))  ??
+      f_def = Expr(:tuple, new_symbols...)
+      f = eval(Expr(:(->), f_def, body))  # evaluate function
+      new_symbols = substitute!.(args, old_symbols)
+      f
     end
 
   else
