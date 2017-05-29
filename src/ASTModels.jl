@@ -12,7 +12,7 @@ include("./util.jl")
 ## expr functionalities ---------------------------------------------------------------------------------------------------------------------------
 
 # when bringing anything else than Expr into an Expr, we preserve the possibility to cast the respective object
-cast = identity
+cast(x) = x  # identity
 
 expr() = Expr(:_)  # empty expression
 
@@ -38,11 +38,20 @@ c = :(c::Any)
 ```
 creating new basic, identifyable Expressions
 """
-macro expr(ss::Symbol...)
+macro expr(ss...)
   es = map(ss) do s
     # expr should be this package's `expr`
     rhs = QuoteNode(expr(s)) # we want this to stay expression
-    :($s = $rhs)
+
+    if isa(s, Symbol)
+      name = s
+    elseif s.head == :(::) && isa(s.args[1], Symbol)
+      name = s.args[1]
+    else
+      error("Can only handle blank symbols or additional ::Type checks.")
+    end
+
+    :($name = $rhs)
   end
   esc(Expr(:block, es..., nothing))  # hygiene
 end
@@ -163,7 +172,6 @@ function merge_models(m::Model, others::Model...; input_fields=default_input_fie
   d = merge_concat(m, others...)
   inputlike = Set(x for k ∈ input_fields for x ∈ d[k])
   outputlike = Set(x for k ∈ output_fields for x ∈ d[k])  # Set() - not working because of some weird non-boolean error
-  # println(input)
   for k in input_fields
     d[k] = [x for x ∈ d[k] if x ∉ outputlike]
   end
@@ -203,31 +211,55 @@ merge_models(models::TypeWithModel...) = merge_models([convert(Model, m) for m i
 #   eval(Symbol(func_name))
 # end
 
-function astfunc(args, body)  # anonymous version
+# function astfunc(args, body::Expr)  # anonymous version
+#   # we need to have Expressions
+#   args = [args...]  # for .() broadcasting
+#   new_symbols = [Expr(:(::), Symbol("p", i), extract_type_info(a)) for (i, a) in enumerate(args)]
+#   old_symbols = substitute!.(args, new_symbols)
+#   f_def = Expr(:tuple, new_symbols...)
+#   f = eval(Expr(:(->), f_def, body))  # evaluate function
+#   new_symbols = substitute!.(args, old_symbols)
+#   f
+# end
+
+function astfunc{T<:Union{Tuple, Array, Expr}}(args, body::T)  # default to interpret body as iterable
   # we need to have Expressions
   args = [args...]  # for .() broadcasting
-  new_symbols = [:($(Symbol("p", i))::Any) for i in 1:length(args)]
-  old_symbols = substitute!.(args, new_symbols)  # Dict(zip(args, symbols))  ??
+  if T <: Tuple
+    body = Expr(:tuple, body...)
+  elseif T <: Array
+    body = Expr(:vect, body...)
+  end
+
+  new_symbols = [Expr(:(::), Symbol("p", i), extract_type_info(a)) for (i, a) in enumerate(args)]
+  old_symbols = substitute!.(args, new_symbols)
   f_def = Expr(:tuple, new_symbols...)
   f = eval(Expr(:(->), f_def, body))  # evaluate function
+
   new_symbols = substitute!.(args, old_symbols)
   f
 end
 
 """ macro to build a function out of AST references """
-macro astfunc(e)
+macro astfunc(e)  # CAUTION: the body always has to be a single expression
   if e.head == :(=)
     f = e.args[1]
-    body = e.args[2]
     f_name = QuoteNode(f.args[1])  # we need f_name to be a symbol if inserted below, not a function
     args = f.args[2:end]
+    body = QuoteNode(ASTModels.ast_minify(e.args[2]))
+
 
     expr = quote
       args = eval.($args)  # seamingly macros don't work well with overwriting
-      body = eval($body)
+      body = $body
+      if body.head ∈ [:tuple, :vect]
+        body.args .= eval.(body.args) # construct tuple with evaluated arguments (this gives the expressions)
+      else
+        body = eval(body)
+      end
 
-      new_symbols = [:($(Symbol(n))::Any) for n in take('a':'z', length(args))]
-      old_symbols = substitute!.(args, new_symbols)  # Dict(zip(args, symbols))  ??
+      new_symbols = [Expr(:(::), Symbol("p", i), ASTModels.extract_type_info(a)) for (i, a) in enumerate(args)]
+      old_symbols = substitute!.(args, new_symbols)
       f_def = Expr(:call, $f_name, new_symbols...)
       eval(Expr(:(=), f_def, body))  # evaluate function
       new_symbols = substitute!.(args, old_symbols)
@@ -235,21 +267,26 @@ macro astfunc(e)
     end
 
   elseif e.head == :(->)
-    body = e.args[2]
     if e.args[1].head == :tuple
       args = e.args[1].args
     else
       args = (e.args[1],)  # single symbol -> tuple of single symbol
     end
+    body = QuoteNode(ASTModels.ast_minify(e.args[2]))
 
     expr = quote
       args = eval.($args)  # seamingly macros don't work well with overwriting
-      body = eval($body)
+      body = $body
+      if body.head ∈ [:tuple, :vect]
+        body.args .= eval.(body.args)  # construct tuple with evaluated arguments (this gives the expressions)
+      else
+        body = eval(body)
+      end
 
       # execute new function in calling namespace in order to refer to correct `cast` function
       # astfunc(args, body)  # this would be executed in ASTModels namespace, referring to its cast function for instance
-      new_symbols = [:($(Symbol(n))::Any) for n in take('a':'z', length(args))]
-      old_symbols = substitute!.(args, new_symbols)  # Dict(zip(args, symbols))  ??
+      new_symbols = [Expr(:(::), Symbol("p", i), ASTModels.extract_type_info(a)) for (i, a) in enumerate(args)]
+      old_symbols = substitute!.(args, new_symbols)
       f_def = Expr(:tuple, new_symbols...)
       f = eval(Expr(:(->), f_def, body))  # evaluate function
       new_symbols = substitute!.(args, old_symbols)
@@ -262,6 +299,7 @@ macro astfunc(e)
 
   esc(expr)
 end
+
 
 """
 clone a given graph with optional new inputs (otherwise old inputs are preserved)

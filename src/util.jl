@@ -1,7 +1,10 @@
 using Iterators
 
+## patches ------------------------------------------------------------------
+
 # we need to fix Base.show_call so that functions get printed such that they can be executed
 # (concretly &, $, - and maybe still others have to be wrapped in parantheses)
+
 import Base: expr_calls, show_call, show_unquoted, show_list, show_enclosed_list
 function show_call(io::IO, head, func, func_args, indent)
     op, cl = expr_calls[head]
@@ -28,24 +31,33 @@ function show_call(io::IO, head, func, func_args, indent)
 end
 
 
-
+## higher-order functions -------------------------------------------
 partial(f, a...; k...) = (b...; l...) -> f(a..., b...; k..., l...)
 
 
+
+## Expr / AST functions -------------------------------------------------
 function_name(f) = split(string(f), ".")[end]  # sometimes string(func) in fact includes the package too
 
-singleton(x::Union{Tuple, Array}) = x
-singleton(x) = (x,)
+extract_type_info(expr::Expr) = expr.head == :(::) ? expr.args[2] : :Any
 
-function inv_singleton(x::Union{Tuple, Array})
-  length(x) == 1  ?  x[1] : x
+function ast_minify(expr::Expr)
+  if expr.head == :block
+    args_ = [a for a in expr.args if isa(a, Expr) && a.head != :line]
+    l = length(args_)
+    if l > 1
+      Expr(:block, args_)
+    elseif l == 1
+      args_[1]
+    else
+      expr
+    end
+  else
+    expr
+  end
 end
-inv_singleton(x) = x
 
-
-import Base.repeat
-repeat(a, n::Integer) = [a for _ in 1:n]
-
+ast_minify(x) = x
 
 
 # function mycombinations(n, a=:a, b=:b)
@@ -118,6 +130,29 @@ end
 traverse_noconflict_methods_sig(cont, func::Function, argtype::DataType=Expr) = traverse_noconflict_methods_sig(func, argtype)(cont)
 
 
+
+
+
+
+## Conversion helpers -----------------------------------------
+
+singleton(x::Union{Tuple, Array}) = x
+singleton(x) = (x,)
+
+function inv_singleton(x::Union{Tuple, Array})
+  length(x) == 1  ?  x[1] : x
+end
+inv_singleton(x) = x
+
+
+
+## general helpers ----------------------------------------------
+import Base.repeat
+repeat(a, n::Integer) = [a for _ in 1:n]
+
+
+
+
 typealias VectorAssociative{K,V} Associative{K, Vector{V}}
 
 function merge_concat!{K,V}(d::VectorAssociative{K,V}, others::VectorAssociative{K,V}...)
@@ -137,6 +172,8 @@ function merge_concat{K,V}(d::VectorAssociative{K,V}, others::VectorAssociative{
   merge_concat!(Dict{K,Vector{V}}(), d, others...)
 end
 
+
+## Exception helpers -------------------------------------------------------
 
 """ use as
 ```
