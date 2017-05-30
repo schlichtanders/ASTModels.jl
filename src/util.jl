@@ -41,6 +41,16 @@ function_name(f) = split(string(f), ".")[end]  # sometimes string(func) in fact 
 
 extract_type_info(expr::Expr) = expr.head == :(::) ? expr.args[2] : :Any
 
+function extract_symbol(expr::Expr)
+  if expr.head == :(::)
+    expr.args[1]
+  else
+    error("Expr not supported: " * string(expr))
+  end
+end
+extract_symbol(s::Symbol) = s
+
+
 function ast_minify(expr::Expr)
   if expr.head == :block
     args_ = [a for a in expr.args if isa(a, Expr) && a.head != :line]

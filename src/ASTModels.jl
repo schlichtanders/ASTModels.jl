@@ -201,28 +201,7 @@ merge_models(models::TypeWithModel...) = merge_models([convert(Model, m) for m i
 # still we need can use them for clone, where we only need a anonymous function
 
 # """ build a function out of AST references """
-# function astfunc(func_name, args, body)  # named version
-#   # we need to have Expressions
-#   new_symbols = [:($(Symbol(n))::Any) for n in take('a':'z', length(args))]
-#   old_symbols = substitute!.(args, new_symbols)  # Dict(zip(args, symbols))  ??
-#   f_def = Expr(:call, func_name, new_symbols...)
-#   eval(Expr(:(=), f_def, body))  # evaluate function
-#   new_symbols = substitute!.(args, old_symbols)
-#   eval(Symbol(func_name))
-# end
-
-# function astfunc(args, body::Expr)  # anonymous version
-#   # we need to have Expressions
-#   args = [args...]  # for .() broadcasting
-#   new_symbols = [Expr(:(::), Symbol("p", i), extract_type_info(a)) for (i, a) in enumerate(args)]
-#   old_symbols = substitute!.(args, new_symbols)
-#   f_def = Expr(:tuple, new_symbols...)
-#   f = eval(Expr(:(->), f_def, body))  # evaluate function
-#   new_symbols = substitute!.(args, old_symbols)
-#   f
-# end
-
-function astfunc{T<:Union{Tuple, Array, Expr}}(args, body::T)  # default to interpret body as iterable
+function astfunc{T<:Union{Tuple, Array, Expr}}(func_name::Symbol, args, body::T, mod::Module=Main, types=[extract_type_info(a) for a in args])  # named version
   # we need to have Expressions
   args = [args...]  # for .() broadcasting
   if T <: Tuple
@@ -231,13 +210,61 @@ function astfunc{T<:Union{Tuple, Array, Expr}}(args, body::T)  # default to inte
     body = Expr(:vect, body...)
   end
 
-  new_symbols = [Expr(:(::), Symbol("p", i), extract_type_info(a)) for (i, a) in enumerate(args)]
-  old_symbols = substitute!.(args, new_symbols)
-  f_def = Expr(:tuple, new_symbols...)
-  f = eval(Expr(:(->), f_def, body))  # evaluate function
+  new_args = [Expr(:(::), Symbol("p", i), t) for (i, t) in enumerate(types)]
+  old_symbols = substitute!.(args, new_args)  # Dict(zip(args, symbols))  ??
+  f_def = Expr(:call, func_name, new_args...)
+  eval(mod, Expr(:(=), f_def, body))  # evaluate function
+  new_args = substitute!.(args, old_symbols)
+  eval(mod, Symbol(func_name))
+end
 
-  new_symbols = substitute!.(args, old_symbols)
+# astfunc{T<:Union{Tuple, Array, Expr}}(func_name::Symbol, args, body::T, mod::Module=Main, types=[extract_type_info(a) for a in args]) = astfunc(func_name, args, [extract_type_info(a) for a in args], body, mod)
+
+
+function astfunc{T<:Union{Tuple, Array, Expr}}(args, body::T, mod::Module=Main, types=[extract_type_info(a) for a in args])  # default to interpret body as iterable
+  # we need to have Expressions
+  args = [args...]  # for .() broadcasting
+  if T <: Tuple
+    body = Expr(:tuple, body...)
+  elseif T <: Array
+    body = Expr(:vect, body...)
+  end
+
+  new_args = [Expr(:(::), Symbol("p", i), t) for (i, t) in enumerate(types)]
+  old_symbols = substitute!.(args, new_args)
+  f_def = Expr(:tuple, new_args...)
+  f = eval(mod, Expr(:(->), f_def, body))  # evaluate function
+
+  new_args = substitute!.(args, old_symbols)
   f
+end
+
+# astfunc{T<:Union{Tuple, Array, Expr}}(args, body::T, mod::Module=Main) = astfunc(args, , body, mod)
+
+function _eval_args_body(args_plain, body, mod::Module=Main)
+  args = [eval(mod, ASTModels.extract_symbol(a)) for a in args_plain]
+  if body.head ∈ [:tuple, :vect]
+    # body.args .= eval(mod, body.args)  # in Julia 0.6 I think this should work
+    for (i, a) in enumerate(body.args)
+      body.args[i] = eval(mod, a)  # eval all subexpressions
+    end
+  else
+    body = eval(mod, body)
+  end
+
+  types = Vector(length(args))
+  for (i, (a, b)) in enumerate(zip(args_plain, args))
+    if isa(a, Expr) && a.head == :(::)  # prefer overwritten types
+      types[i] = a.args[2]
+      if ASTModels.extract_type_info(b) != :Any
+        warn("Overwrote Type Information for " * string(b))
+      end
+    else
+      types[i] = ASTModels.extract_type_info(b)
+    end
+  end
+
+  args, body, types
 end
 
 """ macro to build a function out of AST references """
@@ -248,22 +275,10 @@ macro astfunc(e)  # CAUTION: the body always has to be a single expression
     args = f.args[2:end]
     body = QuoteNode(ASTModels.ast_minify(e.args[2]))
 
-
     expr = quote
-      args = eval.($args)  # seamingly macros don't work well with overwriting
-      body = $body
-      if body.head ∈ [:tuple, :vect]
-        body.args .= eval.(body.args) # construct tuple with evaluated arguments (this gives the expressions)
-      else
-        body = eval(body)
-      end
-
-      new_symbols = [Expr(:(::), Symbol("p", i), ASTModels.extract_type_info(a)) for (i, a) in enumerate(args)]
-      old_symbols = substitute!.(args, new_symbols)
-      f_def = Expr(:call, $f_name, new_symbols...)
-      eval(Expr(:(=), f_def, body))  # evaluate function
-      new_symbols = substitute!.(args, old_symbols)
-      eval(Symbol($f_name))
+      mod = current_module()
+      args, body, types = ASTModels._eval_args_body($args, $body, mod)
+      ASTModels.astfunc($f_name, args, body, mod, types)
     end
 
   elseif e.head == :(->)
@@ -275,29 +290,16 @@ macro astfunc(e)  # CAUTION: the body always has to be a single expression
     body = QuoteNode(ASTModels.ast_minify(e.args[2]))
 
     expr = quote
-      args = eval.($args)  # seamingly macros don't work well with overwriting
-      body = $body
-      if body.head ∈ [:tuple, :vect]
-        body.args .= eval.(body.args)  # construct tuple with evaluated arguments (this gives the expressions)
-      else
-        body = eval(body)
-      end
-
-      # execute new function in calling namespace in order to refer to correct `cast` function
-      # astfunc(args, body)  # this would be executed in ASTModels namespace, referring to its cast function for instance
-      new_symbols = [Expr(:(::), Symbol("p", i), ASTModels.extract_type_info(a)) for (i, a) in enumerate(args)]
-      old_symbols = substitute!.(args, new_symbols)
-      f_def = Expr(:tuple, new_symbols...)
-      f = eval(Expr(:(->), f_def, body))  # evaluate function
-      new_symbols = substitute!.(args, old_symbols)
-      f
+      mod = current_module()
+      args, body, types = ASTModels._eval_args_body($args, $body, mod)
+      ASTModels.astfunc(args, body, mod, types)
     end
 
   else
     error("Use this macro for simple function syntax only.")
   end
 
-  esc(expr)
+  expr  # we don't want to escape things as all variables are indeed for internal purposes
 end
 
 
