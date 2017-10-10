@@ -12,13 +12,22 @@ merge_models(di)
 
 di1 = Dict("inputs"=>[a], "outputs"=>[c])
 di2 = Dict("inputs"=>[c, b], "outputs"=>[d])
-merge_models(di1, di2)
+dm = merge_models(di1, di2)
+
+# clone still does not make sense, as parameters are not cloned - We would have to generate new parameters....
+# TODO only true inputs would have to be preserved ..
+dc = clone(dm)
+dc["inputs"] === dm["inputs"]
+dc["outputs"] === dm["outputs"]
+dc["outputs"] == dm["outputs"]
 
 ti1 = TestTypeWithModel(di1)
 ti2 = TestTypeWithModel(di2)
 merge_models(ti1, ti2)
-## test function compilation
 
+
+
+## test function compilation
 
 
 # macroexpand(:(@ast_func h(a,b) = d))

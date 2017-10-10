@@ -6,8 +6,8 @@ export
   traverse_ASTleaves
 
 using Continuables
+using DataStructures
 include("./util.jl")
-
 
 ## expr functionalities ---------------------------------------------------------------------------------------------------------------------------
 
@@ -165,18 +165,28 @@ end
 typealias Model VectorAssociative{String, Expr}
 # typealias Model Dict{String, Vector{Expr}}
 
-default_input_fields = ["inputs"]
-default_output_fields = ["outputs"]
-
-function merge_models(m::Model, others::Model...; input_fields=default_input_fields, output_fields=default_output_fields)
+# input field convention:
+# outputs and anything starting with out is an outputfield (this is due to there normally being a lot of input things and only a few output things)
+function merge_models(m::Model, others::Model...)
   d = merge_concat(m, others...)
-  inputlike = Set(x for k ∈ input_fields for x ∈ d[k])
-  outputlike = Set(x for k ∈ output_fields for x ∈ d[k])  # Set() - not working because of some weird non-boolean error
-  for k in input_fields
-    d[k] = [x for x ∈ d[k] if x ∉ outputlike]
+
+  inputlike, outputlike = Vector{Expr}(), Vector{Expr}()
+  for k ∈ keys(d)
+    if startswith(k, "out")
+      append!(outputlike, d[k])
+    else
+      append!(inputlike, d[k])
+    end
   end
-  for k in output_fields
-    d[k] = [x for x ∈ d[k] if x ∉ inputlike]
+  inputlike, outputlike = Set(inputlike), Set(outputlike)
+
+  for k ∈ keys(d)
+    if startswith(k, "out")
+      d[k] = [x for x ∈ d[k] if x ∉ inputlike]
+    else
+      d[k] = [x for x ∈ d[k] if x ∉ outputlike]
+    end
+    isempty(d[k]) && delete!(d, k)
   end
   d
 end
@@ -193,8 +203,30 @@ import Base.convert
 convert(::Type{Model}, x::TypeWithModel) = x.dict
 merge_models(models::TypeWithModel...) = merge_models([convert(Model, m) for m in models]...)  # we somehow have to manually call convert.
 
+function clone(model::Model)
+  model2 = copy(model)
 
-## building function out of astmodels
+  # copy all parameters
+  for k in keys(model2)
+    if startswith(k, "param")
+      model2[k] = copy.(model2[k])
+    end
+  end
+
+  # collect everything which is not output
+  oldinputs = collect(Base.flatten([model[k] for k in keys(model) if !startswith(k, "out")]))
+  newinputs = collect(Base.flatten([model2[k] for k in keys(model) if !startswith(k, "out")]))
+
+  # new output variables
+  for k in keys(model2)
+    if startswith(k, "out")
+      model2[k] = clone(oldinputs, model2[k], newinputs)
+    end
+  end
+  model2
+end
+
+## building function out of astmodels ---------------------------------------------------------------------------
 
 
 # functions unfortunately don't work, as ``eval`` is going to execute the code within ASTModels, however we want it to be executed in the calling evironment
@@ -340,5 +372,44 @@ traverse_ASTleaves(expr::Expr) = cont -> begin
   end
 end
 traverse_ASTleaves(cont, expr::Expr) = traverse_ASTleaves(expr)(cont)
+
+
+
+
+
+
+## working with ASTModels --------------------------------------------------------------------------------------
+
+
+
+# here we see one drawback of ASTModels: the explicit dependency structure captured normally in order of execution easily is lost here
+# we have to reconstruct the dependencies by traversing the AST
+# as this is only needed at construction time and not runtime, it is still okay to do so
+
+
+# this one seems very efficient and short written
+function sort_by_dependency(list_of_expr::Vector{Expr})
+  l = pointer_from_objref.(list_of_expr)
+  deps_in!(list_of_expr, Set(l), Set(l))
+end
+sort_by_dependency(cont, list_of_expr::Vector{Expr}) = sort_by_dependency(list_of_expr)(cont)
+
+function deps_in!{T<:Any}(cont, es::Vector{T}, pointers!, pointers)
+  for e ∈ es
+    !isa(e, Expr) && continue
+
+    if pointer_from_objref(e) ∈ pointers!  # go into everything we haven't seen yet
+      setdiff!(pointers!, [pointer_from_objref(e)])
+      deps_in!(cont, e.args[2:end], pointers!, pointers)  # the first element of e.args is the name of the function or co, i.e. not needed
+      cont(e)
+    elseif pointer_from_objref(e) ∈ pointers  # don't traverse things again which we already traversed
+      continue   # the first element of e.args is the name of the function or co, i.e. not needed
+    else
+      deps_in!(cont, e.args[2:end], pointers!, pointers)
+    end
+  end
+end
+deps_in!{T<:Any}(es::Vector{T}, pointers!, pointers) = cont -> deps_in!(cont, es, pointers!, pointers)
+
 
 end # module
